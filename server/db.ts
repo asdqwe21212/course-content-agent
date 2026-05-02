@@ -146,7 +146,10 @@ export async function getLectureContent(taskId: number) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
 
-  const result = await db.select().from(lectureContent).where(eq(lectureContent.taskId, taskId)).limit(1);
+  const result = await db.select().from(lectureContent)
+    .where(eq(lectureContent.taskId, taskId))
+    .orderBy(desc(lectureContent.id))
+    .limit(1);
   return result.length > 0 ? result[0] : null;
 }
 
@@ -169,7 +172,10 @@ export async function getExercisesAndAnswers(taskId: number) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
 
-  const result = await db.select().from(exercisesAndAnswers).where(eq(exercisesAndAnswers.taskId, taskId)).limit(1);
+  const result = await db.select().from(exercisesAndAnswers)
+    .where(eq(exercisesAndAnswers.taskId, taskId))
+    .orderBy(desc(exercisesAndAnswers.id))
+    .limit(1);
   return result.length > 0 ? result[0] : null;
 }
 
@@ -206,7 +212,10 @@ export async function getAssessmentReport(taskId: number) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
 
-  const result = await db.select().from(assessmentReport).where(eq(assessmentReport.taskId, taskId)).limit(1);
+  const result = await db.select().from(assessmentReport)
+    .where(eq(assessmentReport.taskId, taskId))
+    .orderBy(desc(assessmentReport.id))
+    .limit(1);
   return result.length > 0 ? result[0] : null;
 }
 
@@ -218,7 +227,8 @@ export async function createAgentExecutionLog(
   status: "pending" | "running" | "completed" | "failed",
   input?: string,
   output?: string,
-  error?: string
+  error?: string,
+  retryCount?: number,
 ) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
@@ -230,7 +240,7 @@ export async function createAgentExecutionLog(
     input,
     output,
     error,
-    retryCount: 0,
+    retryCount: retryCount ?? 0,
   });
 
   return result;
@@ -243,6 +253,9 @@ export async function updateAgentExecutionLog(
     output?: string;
     error?: string;
     retryCount?: number;
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
   }
 ) {
   const db = await getDb();

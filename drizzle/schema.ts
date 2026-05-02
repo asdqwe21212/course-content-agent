@@ -100,6 +100,9 @@ export const agentExecutionLog = mysqlTable("agent_execution_log", {
   output: text("output"), // 输出内容
   error: text("error"), // 错误信息
   retryCount: int("retry_count").default(0).notNull(),
+  promptTokens: int("prompt_tokens").default(0).notNull(),
+  completionTokens: int("completion_tokens").default(0).notNull(),
+  totalTokens: int("total_tokens").default(0).notNull(),
   createdAt: timestamp("created_at").defaultNow().notNull(),
   updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
 });

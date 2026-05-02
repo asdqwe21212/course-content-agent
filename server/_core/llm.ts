@@ -296,10 +296,10 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
     payload.tool_choice = normalizedToolChoice;
   }
 
-  payload.max_tokens = 32768
+  payload.max_tokens = parseInt(process.env.LLM_MAX_TOKENS || "32768", 10);
   payload.thinking = {
-    "budget_tokens": 128
-  }
+    budget_tokens: parseInt(process.env.LLM_THINKING_BUDGET || "4096", 10),
+  };
 
   const normalizedResponseFormat = normalizeResponseFormat({
     responseFormat,

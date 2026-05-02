@@ -6,17 +6,24 @@ import {
   createAssessmentReport,
   createAgentExecutionLog,
   updateAgentExecutionLog,
-  getAgentExecutionLogs,
   getCourseTask,
 } from "./db";
 import {
   contentGenerationAgent,
   exerciseGenerationAgent,
   assessmentAgent,
+  TokenUsage,
 } from "./agents";
 import { notifyOwner } from "./_core/notification";
 
 const MAX_RETRIES = 2;
+
+function logTokenUsage(agentName: string, usage: TokenUsage) {
+  console.log(
+    `[Pipeline] ${agentName} token usage: ` +
+    `prompt=${usage.promptTokens}, completion=${usage.completionTokens}, total=${usage.totalTokens}`
+  );
+}
 
 /**
  * Agent 协作流水线：按顺序执行内容生成、习题生成、评估 Agent
@@ -49,41 +56,57 @@ export async function courseContentPipeline(
     let answers = "";
     let assessmentPassed = false;
     let retryCount = 0;
+    let totalTokensUsed = 0;
 
     // 2. 重试循环：内容生成 -> 习题生成 -> 评估
     while (retryCount <= MAX_RETRIES && !assessmentPassed) {
+      let contentLogId = 0;
+      let exerciseLogId = 0;
+      let assessmentLogId = 0;
+
       try {
         // 2.1 内容生成 Agent
         const contentLogResult = await createAgentExecutionLog(
           taskId,
           "content",
           "running",
-          outline
+          outline,
+          undefined,
+          undefined,
+          retryCount,
         );
-        const contentLogId = (contentLogResult as any).insertId || 0;
+        contentLogId = (contentLogResult as any).insertId || 0;
 
         const contentResult = await contentGenerationAgent(outline);
         lectureContent = contentResult.content;
         knowledgePoints = contentResult.knowledgePoints;
 
+        logTokenUsage("Content", contentResult.usage);
+        totalTokensUsed += contentResult.usage.totalTokens;
+
         await updateAgentExecutionLog(contentLogId, {
           status: "completed",
           output: lectureContent,
+          retryCount,
+          promptTokens: contentResult.usage.promptTokens,
+          completionTokens: contentResult.usage.completionTokens,
+          totalTokens: contentResult.usage.totalTokens,
         });
 
-        // 保存讲义内容（第一次创建，后续重试会覆盖）
-        if (retryCount === 0) {
-          await createLectureContent(taskId, lectureContent, knowledgePoints);
-        }
+        // 每次执行都保存讲义内容（重试时会新增记录，查询时取最新）
+        await createLectureContent(taskId, lectureContent, knowledgePoints);
 
         // 2.2 习题生成 Agent
         const exerciseLogResult = await createAgentExecutionLog(
           taskId,
           "exercise",
           "running",
-          lectureContent
+          lectureContent.substring(0, 500),
+          undefined,
+          undefined,
+          retryCount,
         );
-        const exerciseLogId = (exerciseLogResult as any).insertId || 0;
+        exerciseLogId = (exerciseLogResult as any).insertId || 0;
 
         const exerciseResult = await exerciseGenerationAgent(
           lectureContent,
@@ -92,24 +115,32 @@ export async function courseContentPipeline(
         exercises = exerciseResult.exercises;
         answers = exerciseResult.answers;
 
+        logTokenUsage("Exercise", exerciseResult.usage);
+        totalTokensUsed += exerciseResult.usage.totalTokens;
+
         await updateAgentExecutionLog(exerciseLogId, {
           status: "completed",
           output: exercises,
+          retryCount,
+          promptTokens: exerciseResult.usage.promptTokens,
+          completionTokens: exerciseResult.usage.completionTokens,
+          totalTokens: exerciseResult.usage.totalTokens,
         });
 
-        // 保存习题和答案（第一次创建，后续重试会覆盖）
-        if (retryCount === 0) {
-          await createExercisesAndAnswers(taskId, exercises, answers);
-        }
+        // 每次执行都保存习题和答案（重试时会新增记录，查询时取最新）
+        await createExercisesAndAnswers(taskId, exercises, answers);
 
         // 2.3 评估 Agent
         const assessmentLogResult = await createAgentExecutionLog(
           taskId,
           "assessment",
           "running",
-          `Lecture: ${lectureContent.substring(0, 200)}\nExercises: ${exercises.substring(0, 200)}`
+          `Lecture: ${lectureContent.substring(0, 300)}\nExercises: ${exercises.substring(0, 300)}`,
+          undefined,
+          undefined,
+          retryCount,
         );
-        const assessmentLogId = (assessmentLogResult as any).insertId || 0;
+        assessmentLogId = (assessmentLogResult as any).insertId || 0;
 
         const assessmentResult = await assessmentAgent(
           lectureContent,
@@ -117,12 +148,19 @@ export async function courseContentPipeline(
           answers
         );
 
+        logTokenUsage("Assessment", assessmentResult.usage);
+        totalTokensUsed += assessmentResult.usage.totalTokens;
+
         await updateAgentExecutionLog(assessmentLogId, {
           status: "completed",
           output: JSON.stringify(assessmentResult),
+          retryCount,
+          promptTokens: assessmentResult.usage.promptTokens,
+          completionTokens: assessmentResult.usage.completionTokens,
+          totalTokens: assessmentResult.usage.totalTokens,
         });
 
-        // 保存评估报告（每次都覆盖最新的评估结果）
+        // 保存评估报告（每次都新增，查询时取最新）
         await createAssessmentReport(
           taskId,
           assessmentResult.lectureScore,
@@ -141,34 +179,40 @@ export async function courseContentPipeline(
           retryCount++;
           if (retryCount <= MAX_RETRIES) {
             console.log(
-              `[Pipeline] Assessment failed, retrying... (${retryCount}/${MAX_RETRIES})`
+              `[Pipeline] Assessment failed (score: ${assessmentResult.overallScore}), retrying... (${retryCount}/${MAX_RETRIES})`
             );
+            console.log(`[Pipeline] Suggestions: ${assessmentResult.suggestions}`);
           }
         }
       } catch (error) {
         console.error("[Pipeline] Agent execution error:", error);
         const errorMsg = error instanceof Error ? error.message : String(error);
 
-        // 记录错误
-        const logs = await getAgentExecutionLogs(taskId);
-        if (logs && logs.length > 0) {
-          const lastLog = logs[logs.length - 1];
-          if (lastLog) {
-            await updateAgentExecutionLog(lastLog.id, {
-              status: "failed",
-              error: errorMsg,
-            });
-          }
+        // 直接标记当前正在执行的 agent 日志为失败
+        if (assessmentLogId > 0) {
+          await updateAgentExecutionLog(assessmentLogId, {
+            status: "failed",
+            error: errorMsg,
+          });
+        } else if (exerciseLogId > 0) {
+          await updateAgentExecutionLog(exerciseLogId, {
+            status: "failed",
+            error: errorMsg,
+          });
+        } else if (contentLogId > 0) {
+          await updateAgentExecutionLog(contentLogId, {
+            status: "failed",
+            error: errorMsg,
+          });
         }
 
         retryCount++;
         if (retryCount > MAX_RETRIES) {
-          // 标记任务为失败
           await updateCourseTaskStatus(taskId, "failed");
           return {
             taskId,
             success: false,
-            message: `Pipeline failed after ${MAX_RETRIES} retries: ${errorMsg}`,
+            message: `Pipeline failed after ${MAX_RETRIES + 1} attempts: ${errorMsg}`,
           };
         }
       }
@@ -178,9 +222,10 @@ export async function courseContentPipeline(
     if (assessmentPassed) {
       await updateCourseTaskStatus(taskId, "completed");
     } else {
-      // 评估多次未通过，标记为失败
       await updateCourseTaskStatus(taskId, "failed");
     }
+
+    console.log(`[Pipeline] Total tokens used: ${totalTokensUsed}`);
 
     // 4. 发送通知给项目所有者（仅在成功时）
     if (assessmentPassed) {
@@ -189,12 +234,11 @@ export async function courseContentPipeline(
         if (task) {
           await notifyOwner({
             title: "课程内容生成完成",
-            content: `课程"${task.title}"的内容生成和质量审核已完成。讲义、习题和答案解析已生成。`,
+            content: `课程"${task.title}"的内容生成和质量审核已完成。\n讲义、习题和答案解析已生成。\n总 Token 用量: ${totalTokensUsed}`,
           });
         }
       } catch (notifyError) {
         console.warn("[Pipeline] Failed to send notification:", notifyError);
-        // 不因通知失败而影响整体流程
       }
     }
 
@@ -203,7 +247,7 @@ export async function courseContentPipeline(
       success: assessmentPassed,
       message: assessmentPassed
         ? "Pipeline completed successfully"
-        : `Pipeline completed but assessment did not pass after ${MAX_RETRIES} retries`,
+        : `Pipeline completed but assessment did not pass after ${MAX_RETRIES + 1} attempts`,
     };
   } catch (error) {
     console.error("[Pipeline] Unexpected error:", error);

@@ -1,11 +1,19 @@
 import { invokeLLM } from "./_core/llm";
 
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
 /**
  * 内容生成 Agent：基于课程大纲进行长链推理，拆解知识点，生成结构化讲义
+ * 使用 json_schema 确保可靠的结构化输出
  */
 export async function contentGenerationAgent(outline: string): Promise<{
   content: string;
   knowledgePoints: string[];
+  usage: TokenUsage;
 }> {
   const systemPrompt = `你是一位资深教育专家和课程设计师。你的任务是根据课程大纲进行深度分析和长链推理，生成结构化的讲义内容。
 
@@ -22,46 +30,80 @@ export async function contentGenerationAgent(outline: string): Promise<{
 课程大纲：
 ${outline}
 
-请生成一份结构清晰、内容完整的讲义，并在最后用 JSON 格式列出所有知识点。
-格式示例：
-\`\`\`json
-{"knowledgePoints": ["知识点1", "知识点2", ...]}
-\`\`\``;
+请生成一份结构清晰、内容完整的讲义，并在 knowledgePoints 字段中列出所有知识点。`;
+
+  const outputSchema = {
+    name: "lecture_content",
+    schema: {
+      type: "object",
+      properties: {
+        content: {
+          type: "string",
+          description: "Markdown 格式的完整讲义内容",
+        },
+        knowledgePoints: {
+          type: "array",
+          items: { type: "string" },
+          description: "提取出的所有知识点列表",
+        },
+      },
+      required: ["content", "knowledgePoints"],
+    },
+    strict: true,
+  };
 
   const response = await invokeLLM({
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
     ],
+    outputSchema,
   });
 
   const msgContent = response.choices[0]?.message?.content;
   const responseText = typeof msgContent === "string" ? msgContent : "";
 
-  // 提取 JSON 格式的知识点
-  const jsonMatch = responseText.match(/```json\n([\s\S]*?)\n```/);
-  let knowledgePoints: string[] = [];
-
-  if (jsonMatch && jsonMatch[1]) {
-    try {
-      const parsed = JSON.parse(jsonMatch[1]);
-      knowledgePoints = parsed.knowledgePoints || [];
-    } catch (e) {
-      console.warn("Failed to parse knowledge points JSON:", e);
-    }
-  }
-
-  // 移除 JSON 块，保留讲义内容
-  const lectureContent = responseText.replace(/```json\n[\s\S]*?\n```/g, "").trim();
-
-  return {
-    content: lectureContent,
-    knowledgePoints,
+  const usage: TokenUsage = {
+    promptTokens: response.usage?.prompt_tokens ?? 0,
+    completionTokens: response.usage?.completion_tokens ?? 0,
+    totalTokens: response.usage?.total_tokens ?? 0,
   };
+
+  try {
+    const parsed = JSON.parse(responseText);
+    return {
+      content: parsed.content || "",
+      knowledgePoints: parsed.knowledgePoints || [],
+      usage,
+    };
+  } catch (e) {
+    console.warn("Failed to parse content agent JSON output, falling back to regex:", e);
+    // 降级方案：用正则提取
+    const jsonMatch = responseText.match(/```json\n([\s\S]*?)\n```/);
+    let knowledgePoints: string[] = [];
+
+    if (jsonMatch && jsonMatch[1]) {
+      try {
+        const parsed = JSON.parse(jsonMatch[1]);
+        knowledgePoints = parsed.knowledgePoints || [];
+      } catch (e2) {
+        console.warn("Fallback parsing also failed:", e2);
+      }
+    }
+
+    const lectureContent = responseText.replace(/```json\n[\s\S]*?\n```/g, "").trim();
+
+    return {
+      content: lectureContent,
+      knowledgePoints,
+      usage,
+    };
+  }
 }
 
 /**
  * 习题生成 Agent：基于讲义内容和知识点生成配套练习题和答案解析
+ * 发送完整讲义内容（不截断）以确保习题质量
  */
 export async function exerciseGenerationAgent(
   lectureContent: string,
@@ -69,6 +111,7 @@ export async function exerciseGenerationAgent(
 ): Promise<{
   exercises: string;
   answers: string;
+  usage: TokenUsage;
 }> {
   const systemPrompt = `你是一位经验丰富的教学设计师和出题专家。你的任务是基于讲义内容和知识点生成高质量的练习题和详细答案解析。
 
@@ -85,8 +128,8 @@ export async function exerciseGenerationAgent(
 知识点：
 ${knowledgePoints.join("\n")}
 
-讲义内容摘要：
-${lectureContent.substring(0, 1000)}...
+讲义内容：
+${lectureContent}
 
 请生成：
 1. 一份包含多道练习题的题库（Markdown 格式）
@@ -104,6 +147,12 @@ ${lectureContent.substring(0, 1000)}...
   const msgContent = response.choices[0]?.message?.content;
   const responseText = typeof msgContent === "string" ? msgContent : "";
 
+  const usage: TokenUsage = {
+    promptTokens: response.usage?.prompt_tokens ?? 0,
+    completionTokens: response.usage?.completion_tokens ?? 0,
+    totalTokens: response.usage?.total_tokens ?? 0,
+  };
+
   // 分离练习题和答案解析
   const exercisesMatch = responseText.match(/##\s*练习题([\s\S]*?)(?=##\s*答案解析|$)/);
   const answersMatch = responseText.match(/##\s*答案解析([\s\S]*?)$/);
@@ -114,11 +163,14 @@ ${lectureContent.substring(0, 1000)}...
   return {
     exercises: `## 练习题\n${exercisesText}`,
     answers: `## 答案解析\n${answersText}`,
+    usage,
   };
 }
 
 /**
  * 评估 Agent：对生成的讲义和习题进行质量审核
+ * 使用 json_schema 确保可靠的结构化输出
+ * 发送完整内容（不截断）以确保评估准确性
  */
 export async function assessmentAgent(
   lectureContent: string,
@@ -132,6 +184,7 @@ export async function assessmentAgent(
   exerciseFeedback: string;
   suggestions: string;
   status: "pass" | "fail";
+  usage: TokenUsage;
 }> {
   const systemPrompt = `你是一位严格的教育质量评审专家。你的任务是对生成的讲义、习题和答案进行全面的质量审核。
 
@@ -155,59 +208,113 @@ export async function assessmentAgent(
 - 60-69：不及格，内容有较多缺陷，需要重大修改
 - <60：不通过，内容存在严重问题，需要重新生成
 
-通过标准：总体评分 >= 80 分`;
+通过标准：总体评分 >= 80 分
+
+请在 feedback 字段中给出具体、可操作的反馈和改进建议。`;
 
   const userPrompt = `请对以下生成的课程内容进行质量评审。
 
 讲义内容：
-${lectureContent.substring(0, 1500)}...
+${lectureContent}
 
 练习题：
-${exercises.substring(0, 1000)}...
+${exercises}
 
 答案解析：
-${answers.substring(0, 1000)}...
+${answers}
 
-请按照以下 JSON 格式返回评审结果：
-\`\`\`json
-{
-  "lectureScore": <0-100>,
-  "exerciseScore": <0-100>,
-  "overallScore": <0-100>,
-  "lectureFeedback": "<讲义反馈>",
-  "exerciseFeedback": "<习题反馈>",
-  "suggestions": "<改进建议>",
-  "status": "<pass|fail>"
-}
-\`\`\``;
+请给出详细的评审结果。`;
+
+  const outputSchema = {
+    name: "assessment_result",
+    schema: {
+      type: "object",
+      properties: {
+        lectureScore: {
+          type: "integer",
+          description: "讲义评分 0-100",
+        },
+        exerciseScore: {
+          type: "integer",
+          description: "习题评分 0-100",
+        },
+        overallScore: {
+          type: "integer",
+          description: "总体评分 0-100",
+        },
+        lectureFeedback: {
+          type: "string",
+          description: "讲义的具体反馈意见",
+        },
+        exerciseFeedback: {
+          type: "string",
+          description: "习题的具体反馈意见",
+        },
+        suggestions: {
+          type: "string",
+          description: "改进建议",
+        },
+        status: {
+          type: "string",
+          enum: ["pass", "fail"],
+          description: "是否通过审核，overallScore >= 80 为 pass",
+        },
+      },
+      required: ["lectureScore", "exerciseScore", "overallScore", "lectureFeedback", "exerciseFeedback", "suggestions", "status"],
+    },
+    strict: true,
+  };
 
   const response = await invokeLLM({
     messages: [
       { role: "system", content: systemPrompt },
       { role: "user", content: userPrompt },
     ],
+    outputSchema,
   });
 
   const msgContent = response.choices[0]?.message?.content;
   const responseText = typeof msgContent === "string" ? msgContent : "";
 
-  // 提取 JSON 格式的评估结果
-  const jsonMatch = responseText.match(/```json\n([\s\S]*?)\n```/);
+  const usage: TokenUsage = {
+    promptTokens: response.usage?.prompt_tokens ?? 0,
+    completionTokens: response.usage?.completion_tokens ?? 0,
+    totalTokens: response.usage?.total_tokens ?? 0,
+  };
 
-  if (jsonMatch && jsonMatch[1]) {
-    try {
-      const result = JSON.parse(jsonMatch[1]);
-      return {
-        lectureScore: result.lectureScore || 0,
-        exerciseScore: result.exerciseScore || 0,
-        overallScore: result.overallScore || 0,
-        lectureFeedback: result.lectureFeedback || "",
-        exerciseFeedback: result.exerciseFeedback || "",
-        suggestions: result.suggestions || "",
-        status: result.status === "pass" ? "pass" : "fail",
-      };
-    } catch (e) {
-      console.error("Failed to parse assessment result:", e);
+  try {
+    const result = JSON.parse(responseText);
+    return {
+      lectureScore: result.lectureScore ?? 0,
+      exerciseScore: result.exerciseScore ?? 0,
+      overallScore: result.overallScore ?? 0,
+      lectureFeedback: result.lectureFeedback || "",
+      exerciseFeedback: result.exerciseFeedback || "",
+      suggestions: result.suggestions || "",
+      status: result.status === "pass" ? "pass" : "fail",
+      usage,
+    };
+  } catch (e) {
+    console.error("Failed to parse assessment result, falling back to regex:", e);
+    // 降级方案：用正则提取 JSON
+    const jsonMatch = responseText.match(/```json\n([\s\S]*?)\n```/);
+
+    if (jsonMatch && jsonMatch[1]) {
+      try {
+        const result = JSON.parse(jsonMatch[1]);
+        return {
+          lectureScore: result.lectureScore || 0,
+          exerciseScore: result.exerciseScore || 0,
+          overallScore: result.overallScore || 0,
+          lectureFeedback: result.lectureFeedback || "",
+          exerciseFeedback: result.exerciseFeedback || "",
+          suggestions: result.suggestions || "",
+          status: result.status === "pass" ? "pass" : "fail",
+          usage,
+        };
+      } catch (e2) {
+        console.error("Fallback parsing also failed:", e2);
+      }
     }
   }
 
@@ -216,9 +323,10 @@ ${answers.substring(0, 1000)}...
     lectureScore: 60,
     exerciseScore: 60,
     overallScore: 60,
-    lectureFeedback: "评估失败",
-    exerciseFeedback: "评估失败",
+    lectureFeedback: "评估失败，无法解析评估结果",
+    exerciseFeedback: "评估失败，无法解析评估结果",
     suggestions: "请重新生成内容",
     status: "fail",
+    usage,
   };
 }
